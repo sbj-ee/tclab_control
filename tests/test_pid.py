@@ -41,10 +41,19 @@ def test_anti_windup_holds_integral_at_saturation():
 
 
 def test_derivative_on_measurement_opposes_rising_pv():
-    pid = PID(kp=0.0, kd=1.0, setpoint=0.0)
+    # out_min negative so the derivative term isn't clamped away at 0.
+    pid = PID(kp=0.0, kd=1.0, setpoint=0.0, out_min=-100.0)
     pid.update(pv=0.0, dt=1.0)          # seeds prev_pv
     out = pid.update(pv=5.0, dt=1.0)    # pv rose 5 in 1s -> derivative = -5
     assert out == pytest.approx(-5.0)
+
+
+def test_derivative_clamped_at_output_limit():
+    # With default out_min=0, a negative derivative output is correctly clamped.
+    pid = PID(kp=0.0, kd=1.0, setpoint=0.0)
+    pid.update(pv=0.0, dt=1.0)
+    out = pid.update(pv=5.0, dt=1.0)
+    assert out == 0.0
 
 
 def test_dt_must_be_positive():
