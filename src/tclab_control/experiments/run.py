@@ -30,23 +30,26 @@ from __future__ import annotations
 import argparse
 import time
 
-from tclab_control.fopdt import fit_step_csv
+from tclab_control.fopdt import FOPDT, fit_step_csv
 from tclab_control.lab import connect
 from tclab_control.logger import RunLogger
 from tclab_control.pid import PID
 from tclab_control.tuning import imc_pid, ziegler_nichols
 
 
-def _build_pid(args) -> PID:
-    """Construct the PID from either a measured fit (+tuning rule) or manual gains."""
+def _build_pid(args) -> tuple[PID, FOPDT | None]:
+    """Construct the PID from either a measured fit (+tuning rule) or manual gains.
+
+    Returns ``(pid, model)`` where ``model`` is ``None`` when gains are supplied manually.
+    """
     if args.from_fit:
         model = fit_step_csv(args.from_fit, channel=args.channel, heater=args.heater)
         rule = imc_pid(model, lam=args.lam) if args.tuning == "imc" else ziegler_nichols(model)
         print(f"Plant: K={model.K:.3f}, τ={model.tau:.1f}s, θ={model.theta:.1f}s "
               f"→ {rule.method}: Kp={rule.kp:.3f} Ti={rule.Ti:.1f}s Td={rule.Td:.1f}s")
-        return rule.to_pid(setpoint=args.setpoint, out_min=0.0, out_max=100.0)
-    return PID(kp=args.kp, ki=args.ki, kd=args.kd, setpoint=args.setpoint,
-               out_min=0.0, out_max=100.0)
+        return rule.to_pid(setpoint=args.setpoint, out_min=0.0, out_max=100.0), model
+    return (PID(kp=args.kp, ki=args.ki, kd=args.kd, setpoint=args.setpoint,
+                out_min=0.0, out_max=100.0), None)
 
 
 def run(pid: PID, setpoint: float, seconds: int, use_sim: bool, live: bool,
@@ -66,7 +69,10 @@ def run(pid: PID, setpoint: float, seconds: int, use_sim: bool, live: bool,
 def run_schedule(pid: PID, schedule: list[tuple[float, int]], use_sim: bool,
                  live: bool, out: str | None = None, plot: str | None = None,
                  channel: str = "T1", heater: str = "Q1",
-                 step_sleep: float = 1.0) -> dict:
+                 step_sleep: float = 1.0,
+                 preheat: tuple[float, float] | None = None,
+                 preheat_u_ss: float | None = None,
+                 model: FOPDT | None = None) -> dict:
     """Run the PID through a sequence of (setpoint, duration_seconds) segments.
 
     The PID integral is NOT reset between segments so there's no bump at
@@ -75,6 +81,12 @@ def run_schedule(pid: PID, schedule: list[tuple[float, int]], use_sim: bool,
 
     Args:
         schedule: list of (setpoint_°C, duration_s) tuples in order.
+        preheat: optional ``(power_pct, until_temp_°C)`` — drives the heater
+            open-loop at ``power_pct`` % until T reaches ``until_temp``, then
+            hands off to PID.  Useful to reach the first setpoint quickly.
+        model: if supplied, used to compute u_ss at each segment transition
+            where the setpoint rises above the current temperature — prevents
+            the integral wind-down dip seen when coming out of a cooling segment.
     """
     total_seconds = sum(s for _, s in schedule)
     ts: list[float] = []
@@ -92,20 +104,56 @@ def run_schedule(pid: PID, schedule: list[tuple[float, int]], use_sim: bool,
     plotter = _LivePlot(first_sp, total_seconds, multi=True) if live else None
     logctx = RunLogger(out) if out else _NullLog()
 
-    set_heater_attr = heater
-    read_temp_attr = channel
-
     with connect(use_sim=use_sim) as lab, logctx as log:
         t0 = time.time()
+
+        if preheat is not None:
+            preheat_power, preheat_until = preheat
+            print(f"  pre-heat: {preheat_power:g}% → until {preheat_until:g}°C")
+            pv = float(getattr(lab, channel))
+            while pv < preheat_until:
+                getattr(lab, heater)(preheat_power)
+                now = time.time() - t0
+                ts.append(now)
+                temps.append(pv)
+                us.append(preheat_power)
+                sps.append(first_sp)
+                log.log(now, lab.T1, lab.T2,
+                        preheat_power if heater == "Q1" else 0.0,
+                        preheat_power if heater == "Q2" else 0.0)
+                if plotter:
+                    plotter.update(ts, temps, us, sps)
+                if step_sleep:
+                    time.sleep(step_sleep)
+                pv = float(getattr(lab, channel))
+            # Bumpless transfer: seed the integral so the first PID output starts
+            # at u_ss (plant steady-state for the setpoint) rather than zero.
+            # Zero integral causes the heater to drop from ~80% to ~Kp*error ≈ 14%,
+            # making the temperature sink ~7°C before the integrator catches up.
+            # Using u_ss instead of preheat_power avoids both the dip and excess
+            # overshoot from an over-loaded integral.
+            u_handoff = preheat_u_ss if preheat_u_ss is not None else preheat_power
+            pid._integral = u_handoff - pid.kp * (pid.setpoint - pv)
+            pid._prev_pv = pv
+            print(f"  pre-heat done ({pv:.1f}°C) → PID taking over")
+
         for seg_idx, (setpoint, seg_seconds) in enumerate(schedule):
             pid.setpoint = setpoint
             if seg_idx > 0:
                 print(f"  → setpoint now {setpoint}°C")
+                # Bumpless transition: when the new setpoint is above the current
+                # temperature and the model is available, re-seed the integral at
+                # u_ss so the heater output starts at a sensible level immediately.
+                # Without this, the integral is wound down from the cooling segment
+                # and the heater stays too low — temperature continues to fall.
+                if model is not None and temps and setpoint > temps[-1]:
+                    u_ss = (setpoint - model.y0) / model.K
+                    pid._integral = u_ss - pid.kp * (setpoint - temps[-1])
             for _ in range(seg_seconds):
                 now = time.time() - t0
-                pv = float(getattr(lab, read_temp_attr))
+                pv = float(getattr(lab, channel))
                 u = pid.update(pv=pv, dt=1.0)
-                getattr(lab, set_heater_attr)(u)
+                getattr(lab, heater)(u)
 
                 ts.append(now)
                 temps.append(pv)
@@ -216,6 +264,24 @@ def _save_plot(t, y, u, sps_or_setpoint, out, channel):
     fig.tight_layout(); fig.savefig(out, dpi=110)
 
 
+def _parse_preheat(value: str, parser: argparse.ArgumentParser) -> tuple[float, float]:
+    """Parse ``"POWER"`` or ``"POWER:UNTIL_TEMP"`` into ``(power_pct, until_temp)``."""
+    parts = value.split(":")
+    try:
+        power = float(parts[0])
+        if len(parts) == 2:
+            until = float(parts[1])
+        elif len(parts) == 1:
+            until = None  # caller fills in the default
+        else:
+            raise ValueError
+    except ValueError:
+        parser.error(f"--preheat must be POWER or POWER:UNTIL_TEMP, got {value!r}")
+    if not (0.0 < power <= 100.0):
+        parser.error(f"--preheat power must be in (0, 100], got {power}")
+    return (power, until)  # until may be None — caller resolves against first setpoint
+
+
 def _parse_schedule(items: list[str]) -> list[tuple[float, int]]:
     """Parse ["50:400", "35:300", ...] into [(50.0, 400), (35.0, 300), ...]."""
     result = []
@@ -255,6 +321,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--live", action="store_true", help="show a live matplotlib window")
     p.add_argument("--out", default=None, help="CSV log path")
     p.add_argument("--plot", default=None, help="save a PNG of the run")
+    p.add_argument("--preheat", default=None, metavar="POWER[:UNTIL_TEMP]",
+                   help="open-loop pre-heat at POWER%% until UNTIL_TEMP°C, then hand off to PID "
+                        "(default UNTIL_TEMP = first setpoint − 5°C); e.g. --preheat 80 or "
+                        "--preheat 80:45")
     args = p.parse_args(argv)
 
     # Validate the plot extension BEFORE a long hardware run, not after.
@@ -274,19 +344,30 @@ def main(argv: list[str] | None = None) -> int:
             schedule = _parse_schedule(args.schedule)
         except argparse.ArgumentTypeError as e:
             p.error(str(e))
+        # Resolve --preheat until-temp default: first setpoint − 5°C.
+        preheat: tuple[float, float] | None = None
+        if args.preheat:
+            power, until = _parse_preheat(args.preheat, p)
+            until = (schedule[0][0] - 5.0) if until is None else until
+            preheat = (power, until)
         total = sum(s for _, s in schedule)
         print(f"Schedule ({len(schedule)} segments, {total}s total, "
               f"{'sim' if args.sim else 'hardware'}):")
         for sp, dur in schedule:
             print(f"  {sp:g}°C for {dur}s")
-        pid = _build_pid(args)
-        # use first segment's setpoint for initial PID setpoint
+        if preheat:
+            print(f"  pre-heat: {preheat[0]:g}% until {preheat[1]:g}°C")
+        pid, model = _build_pid(args)
         pid.setpoint = schedule[0][0]
+        # Steady-state heater for the first setpoint — used to seed the PID
+        # integral at the preheat handoff (bumpless transfer without overshoot).
+        preheat_u_ss = ((schedule[0][0] - model.y0) / model.K) if model else None
         run_schedule(pid, schedule, use_sim=args.sim, live=args.live,
                      out=args.out, plot=args.plot, channel=args.channel,
-                     heater=args.heater)
+                     heater=args.heater, preheat=preheat, preheat_u_ss=preheat_u_ss,
+                     model=model)
     else:
-        pid = _build_pid(args)
+        pid, _ = _build_pid(args)
         print(f"Running closed loop → setpoint {args.setpoint}°C for {args.seconds}s "
               f"({'sim' if args.sim else 'hardware'})...")
         run(pid, args.setpoint, args.seconds, use_sim=args.sim, live=args.live,

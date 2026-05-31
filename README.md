@@ -45,6 +45,11 @@ uv run tclab-fit  data/step_hw.csv --plot data/fit_hw.png
 # 3. Closed-loop PID run, gains derived from the measured fit
 uv run tclab-run --from-fit data/step_hw.csv --setpoint 50 --tuning imc \
                  --out data/run_hw.csv --plot data/run_hw.png
+
+# 3b. Multi-setpoint schedule — "50°C for 400s, then 35°C for 400s, then 40°C for 300s"
+uv run tclab-run --from-fit data/step_hw.csv \
+                 --schedule "50:400" "35:400" "40:300" \
+                 --out data/schedule_hw.csv --plot data/schedule_hw.png
 ```
 
 **Measured plant (real TCLab, 2026-05-31):** K = 0.694 °C/%, τ = 142.9 s, θ = 19.85 s
