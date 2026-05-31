@@ -36,6 +36,7 @@ Repository = "https://github.com/sbj-ee/tclab_control"
 tclab-step = "tclab_control.experiments.step_test:main"
 tclab-fit = "tclab_control.experiments.fit_step:main"
 tclab-tune = "tclab_control.experiments.tune:main"
+tclab-run = "tclab_control.experiments.run:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tclab_control"]
