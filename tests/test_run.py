@@ -37,3 +37,24 @@ def test_run_saves_plot(tmp_path):
     png = tmp_path / "run.png"
     run(pid, setpoint=35.0, seconds=4, use_sim=True, live=False, plot=str(png), step_sleep=0)
     assert png.exists() and png.stat().st_size > 0
+
+
+def test_main_rejects_non_image_plot_extension(capsys):
+    # argparse .error() exits 2; must happen before any run.
+    from tclab_control.experiments.run import main
+    import pytest as _pytest
+
+    with _pytest.raises(SystemExit) as exc:
+        main(["--setpoint", "50", "--sim", "--plot", "data/run_hw.csv"])
+    assert exc.value.code == 2
+    assert "image extension" in capsys.readouterr().err
+
+
+def test_live_falls_back_to_headless_without_gui(tmp_path, monkeypatch):
+    # Force "no GUI backend" → run() should flip live off and still complete.
+    import tclab_control.experiments.run as runmod
+
+    monkeypatch.setattr(runmod, "_have_gui_backend", lambda: False)
+    pid = _pid_from_plantish()
+    out = runmod.run(pid, setpoint=35.0, seconds=3, use_sim=True, live=True, step_sleep=0)
+    assert len(out["t"]) == 3

@@ -55,6 +55,11 @@ def run(pid: PID, setpoint: float, seconds: int, use_sim: bool, live: bool,
     temps: list[float] = []
     us: list[float] = []
 
+    if live and not _have_gui_backend():
+        print("note: no interactive matplotlib backend (Agg) — running headless. "
+              "Install a GUI backend (e.g. pip install pyqt5) for a live window; "
+              "the run still logs to --out and saves --plot.")
+        live = False
     plotter = _LivePlot(setpoint, seconds) if live else None
     logctx = RunLogger(out) if out else _NullLog()
 
@@ -103,6 +108,16 @@ class _NullLog:
         pass
 
 
+def _have_gui_backend() -> bool:
+    """True if matplotlib can open an interactive window in this environment."""
+    import matplotlib
+
+    backend = matplotlib.get_backend().lower()
+    if backend == "agg":  # headless default → no window possible
+        return False
+    return True
+
+
 class _LivePlot:
     """Minimal real-time two-panel plot (T vs setpoint, heater %)."""
 
@@ -143,9 +158,8 @@ class _LivePlot:
 
 
 def _save_plot(t, y, u, setpoint, out, channel):
-    import matplotlib
-
-    matplotlib.use("Agg")
+    # savefig works on any backend; don't force Agg here so a live GUI session
+    # isn't disrupted. (Headless default is already Agg.)
     import matplotlib.pyplot as plt
 
     fig, (ax, axu) = plt.subplots(2, 1, figsize=(9, 6), sharex=True,
@@ -181,6 +195,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", default=None, help="CSV log path")
     p.add_argument("--plot", default=None, help="save a PNG of the run")
     args = p.parse_args(argv)
+
+    # Validate the plot extension BEFORE a long hardware run, not after.
+    if args.plot:
+        ok = (".eps", ".jpeg", ".jpg", ".pdf", ".pgf", ".png", ".ps", ".raw",
+              ".rgba", ".svg", ".svgz", ".tif", ".tiff", ".webp")
+        if not args.plot.lower().endswith(ok):
+            p.error(f"--plot must end in an image extension (e.g. .png); got {args.plot!r}")
 
     pid = _build_pid(args)
     print(f"Running closed loop → setpoint {args.setpoint}°C for {args.seconds}s "
