@@ -191,8 +191,11 @@ class _NullLog:
 
 def _have_gui_backend() -> bool:
     """True if matplotlib can open an interactive window in this environment."""
+    import os
     import matplotlib
 
+    # Suppress Wayland QPA activation warnings that flood the terminal.
+    os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.wayland*=false")
     backend = matplotlib.get_backend().lower()
     if backend == "agg":  # headless default → no window possible
         return False
