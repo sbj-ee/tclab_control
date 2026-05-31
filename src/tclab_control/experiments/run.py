@@ -3,8 +3,13 @@
 Drives the real board (or the simulator) to a setpoint using PID gains derived from
 a measured FOPDT fit, showing T1 vs. setpoint and heater % updating in real time.
 
-    # gains from a measured step fit, live window, real board:
+    # single setpoint, live window, real board:
     tclab-run --from-fit data/step_hw.csv --setpoint 50 --tuning imc --live
+
+    # multi-setpoint schedule — "50C for 400s, then 35C for 400s, then 40C for 300s, then 25C for 600s":
+    tclab-run --from-fit data/step_hw.csv --live \
+              --schedule "50:400" "35:400" "40:300" "25:600" \
+              --out data/schedule.csv --plot data/schedule.png
 
     # offline dry run on the simulator (no hardware, no window):
     tclab-run --from-fit data/step_hw.csv --setpoint 50 --sim --seconds 120
@@ -17,6 +22,7 @@ Notes:
     own terminal). Without ``--live`` it runs headless and can still save a PNG
     via ``--plot`` and a CSV via ``--out``.
   - Only one process can hold the serial port; close other TCLab programs first.
+  - Cooling is passive (no fan) — dropping setpoints takes longer than rising ones.
 """
 
 from __future__ import annotations
@@ -51,50 +57,77 @@ def run(pid: PID, setpoint: float, seconds: int, use_sim: bool, live: bool,
     ``step_sleep`` is the wall-clock delay between samples (1 s for real runs;
     tests pass 0 to run fast).
     """
+    schedule = [(setpoint, seconds)]
+    return run_schedule(pid, schedule, use_sim=use_sim, live=live, out=out,
+                        plot=plot, channel=channel, heater=heater,
+                        step_sleep=step_sleep)
+
+
+def run_schedule(pid: PID, schedule: list[tuple[float, int]], use_sim: bool,
+                 live: bool, out: str | None = None, plot: str | None = None,
+                 channel: str = "T1", heater: str = "Q1",
+                 step_sleep: float = 1.0) -> dict:
+    """Run the PID through a sequence of (setpoint, duration_seconds) segments.
+
+    The PID integral is NOT reset between segments so there's no bump at
+    transitions — it continues tracking smoothly.  The setpoint is updated
+    instantaneously at each boundary.
+
+    Args:
+        schedule: list of (setpoint_°C, duration_s) tuples in order.
+    """
+    total_seconds = sum(s for _, s in schedule)
     ts: list[float] = []
     temps: list[float] = []
     us: list[float] = []
+    sps: list[float] = []   # setpoint trace for the plot
 
     if live and not _have_gui_backend():
         print("note: no interactive matplotlib backend (Agg) — running headless. "
-              "Install a GUI backend (e.g. pip install pyqt5) for a live window; "
+              "Install a GUI backend (e.g. uv pip install pyqt5) for a live window; "
               "the run still logs to --out and saves --plot.")
         live = False
-    plotter = _LivePlot(setpoint, seconds) if live else None
+
+    first_sp = schedule[0][0]
+    plotter = _LivePlot(first_sp, total_seconds, multi=True) if live else None
     logctx = RunLogger(out) if out else _NullLog()
 
-    set_heater_attr = heater  # "Q1" -> lab.Q1(...)
-    read_temp_attr = channel  # "T1" -> lab.T1
+    set_heater_attr = heater
+    read_temp_attr = channel
 
     with connect(use_sim=use_sim) as lab, logctx as log:
         t0 = time.time()
-        for _ in range(seconds):
-            now = time.time() - t0
-            pv = float(getattr(lab, read_temp_attr))
-            u = pid.update(pv=pv, dt=1.0)
-            getattr(lab, set_heater_attr)(u)
+        for seg_idx, (setpoint, seg_seconds) in enumerate(schedule):
+            pid.setpoint = setpoint
+            if seg_idx > 0:
+                print(f"  → setpoint now {setpoint}°C")
+            for _ in range(seg_seconds):
+                now = time.time() - t0
+                pv = float(getattr(lab, read_temp_attr))
+                u = pid.update(pv=pv, dt=1.0)
+                getattr(lab, set_heater_attr)(u)
 
-            ts.append(now)
-            temps.append(pv)
-            us.append(u)
-            log.log(now, lab.T1, lab.T2,
-                    u if heater == "Q1" else 0.0, u if heater == "Q2" else 0.0)
-            if plotter:
-                plotter.update(ts, temps, us)
-            if step_sleep:
-                time.sleep(step_sleep)
-        # Safety: heaters off on exit (connect()'s context also turns them off).
+                ts.append(now)
+                temps.append(pv)
+                us.append(u)
+                sps.append(setpoint)
+                log.log(now, lab.T1, lab.T2,
+                        u if heater == "Q1" else 0.0, u if heater == "Q2" else 0.0)
+                if plotter:
+                    plotter.update(ts, temps, us, sps)
+                if step_sleep:
+                    time.sleep(step_sleep)
         try:
             lab.Q1(0); lab.Q2(0)
         except Exception:
             pass
 
     if plot:
-        _save_plot(ts, temps, us, setpoint, plot, channel)
+        _save_plot(ts, temps, us, sps, plot, channel)
         print(f"plot -> {plot}")
     if plotter:
         plotter.finish()
-    return {"t": ts, channel: temps, heater: us}
+    return {"t": ts, channel: temps, heater: us, "setpoint": sps}
 
 
 class _NullLog:
@@ -121,7 +154,7 @@ def _have_gui_backend() -> bool:
 class _LivePlot:
     """Minimal real-time two-panel plot (T vs setpoint, heater %)."""
 
-    def __init__(self, setpoint: float, seconds: int):
+    def __init__(self, setpoint: float, seconds: int, multi: bool = False):
         import matplotlib.pyplot as plt
 
         self.plt = plt
@@ -129,8 +162,14 @@ class _LivePlot:
         self.fig, (self.ax, self.axu) = plt.subplots(
             2, 1, figsize=(9, 6), sharex=True, gridspec_kw={"height_ratios": [2, 1]}
         )
-        self.ax.axhline(setpoint, color="k", ls="--", lw=1, label=f"setpoint {setpoint:g}°C")
-        (self.line,) = self.ax.plot([], [], "b-", lw=2, label="T")
+        (self.line,) = self.ax.plot([], [], "b-", lw=2, label="T1 measured")
+        # setpoint trace: step line for multi-setpoint, dashed for single
+        if multi:
+            (self.spline,) = self.ax.plot([], [], "k--", lw=1.5, label="setpoint")
+        else:
+            self.ax.axhline(setpoint, color="k", ls="--", lw=1,
+                            label=f"setpoint {setpoint:g}°C")
+            self.spline = None
         (self.uline,) = self.axu.plot([], [], color="tab:orange", lw=1.5, label="heater %")
         self.ax.set_ylabel("T (°C)")
         self.ax.set_title("TCLab closed loop (live)")
@@ -140,11 +179,12 @@ class _LivePlot:
         self.axu.set_xlabel("time (s)")
         self.axu.set_ylim(-5, 105)
         self.axu.grid(alpha=0.3)
-        self.setpoint = setpoint
         self.fig.tight_layout()
 
-    def update(self, t, y, u):
+    def update(self, t, y, u, sps=None):
         self.line.set_data(t, y)
+        if self.spline is not None and sps is not None:
+            self.spline.set_data(t, sps)
         self.uline.set_data(t, u)
         self.ax.relim(); self.ax.autoscale_view()
         self.axu.set_xlim(0, max(10, t[-1]))
@@ -157,16 +197,18 @@ class _LivePlot:
         self.plt.show()
 
 
-def _save_plot(t, y, u, setpoint, out, channel):
-    # savefig works on any backend; don't force Agg here so a live GUI session
-    # isn't disrupted. (Headless default is already Agg.)
+def _save_plot(t, y, u, sps_or_setpoint, out, channel):
     import matplotlib.pyplot as plt
 
     fig, (ax, axu) = plt.subplots(2, 1, figsize=(9, 6), sharex=True,
                                   gridspec_kw={"height_ratios": [2, 1]})
-    ax.axhline(setpoint, color="k", ls="--", lw=1, label=f"setpoint {setpoint:g}°C")
+    if isinstance(sps_or_setpoint, (int, float)):
+        ax.axhline(sps_or_setpoint, color="k", ls="--", lw=1.5,
+                   label=f"setpoint {sps_or_setpoint:g}°C")
+    else:
+        ax.plot(t, sps_or_setpoint, "k--", lw=1.5, label="setpoint")
     ax.plot(t, y, "b-", lw=2, label=channel)
-    ax.set_ylabel("T (°C)"); ax.legend(); ax.grid(alpha=0.3)
+    ax.set_ylabel("T (°C)"); ax.legend(fontsize=8); ax.grid(alpha=0.3)
     ax.set_title("TCLab closed-loop run (measured)")
     axu.plot(t, u, color="tab:orange", lw=1.5)
     axu.set_ylabel("heater %"); axu.set_xlabel("time (s)")
@@ -174,10 +216,29 @@ def _save_plot(t, y, u, setpoint, out, channel):
     fig.tight_layout(); fig.savefig(out, dpi=110)
 
 
+def _parse_schedule(items: list[str]) -> list[tuple[float, int]]:
+    """Parse ["50:400", "35:300", ...] into [(50.0, 400), (35.0, 300), ...]."""
+    result = []
+    for item in items:
+        try:
+            sp, dur = item.split(":")
+            result.append((float(sp), int(dur)))
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"schedule items must be 'setpoint:seconds', got {item!r}"
+            )
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Run a PID closed loop on the TCLab (Step 3/4 HW).")
-    p.add_argument("--setpoint", type=float, required=True, help="target °C")
-    p.add_argument("--seconds", type=int, default=600, help="run duration (s)")
+    sp_group = p.add_mutually_exclusive_group(required=True)
+    sp_group.add_argument("--setpoint", type=float,
+                          help="single target °C")
+    sp_group.add_argument("--schedule", nargs="+", metavar="SP:SECS",
+                          help='multi-setpoint schedule e.g. "50:400" "35:400" "40:300" "25:600"')
+    p.add_argument("--seconds", type=int, default=600,
+                   help="run duration (s) — only used with --setpoint, not --schedule")
     src = p.add_argument_group("gains (use --from-fit OR manual --kp/--ki/--kd)")
     src.add_argument("--from-fit", metavar="CSV", help="derive gains from a step-test CSV")
     src.add_argument("--tuning", choices=["imc", "zn"], default="imc", help="rule for --from-fit")
@@ -203,11 +264,33 @@ def main(argv: list[str] | None = None) -> int:
         if not args.plot.lower().endswith(ok):
             p.error(f"--plot must end in an image extension (e.g. .png); got {args.plot!r}")
 
-    pid = _build_pid(args)
-    print(f"Running closed loop → setpoint {args.setpoint}°C for {args.seconds}s "
-          f"({'sim' if args.sim else 'hardware'})...")
-    run(pid, args.setpoint, args.seconds, use_sim=args.sim, live=args.live,
-        out=args.out, plot=args.plot, channel=args.channel, heater=args.heater)
+    # _build_pid uses args.setpoint to configure the PID setpoint field.
+    # For --schedule, we'll override it immediately in the schedule branch.
+    if args.setpoint is None:
+        args.setpoint = 0.0   # placeholder; overridden below
+
+    if args.schedule:
+        try:
+            schedule = _parse_schedule(args.schedule)
+        except argparse.ArgumentTypeError as e:
+            p.error(str(e))
+        total = sum(s for _, s in schedule)
+        print(f"Schedule ({len(schedule)} segments, {total}s total, "
+              f"{'sim' if args.sim else 'hardware'}):")
+        for sp, dur in schedule:
+            print(f"  {sp:g}°C for {dur}s")
+        pid = _build_pid(args)
+        # use first segment's setpoint for initial PID setpoint
+        pid.setpoint = schedule[0][0]
+        run_schedule(pid, schedule, use_sim=args.sim, live=args.live,
+                     out=args.out, plot=args.plot, channel=args.channel,
+                     heater=args.heater)
+    else:
+        pid = _build_pid(args)
+        print(f"Running closed loop → setpoint {args.setpoint}°C for {args.seconds}s "
+              f"({'sim' if args.sim else 'hardware'})...")
+        run(pid, args.setpoint, args.seconds, use_sim=args.sim, live=args.live,
+            out=args.out, plot=args.plot, channel=args.channel, heater=args.heater)
     return 0
 
 
