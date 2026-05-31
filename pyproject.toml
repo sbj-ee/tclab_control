@@ -20,6 +20,7 @@ classifiers = [
 
 dependencies = [
     "numpy",
+    "scipy",
     "matplotlib",
 ]
 
@@ -33,6 +34,7 @@ Repository = "https://github.com/sbj-ee/tclab_control"
 
 [project.scripts]
 tclab-step = "tclab_control.experiments.step_test:main"
+tclab-fit = "tclab_control.experiments.fit_step:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tclab_control"]
