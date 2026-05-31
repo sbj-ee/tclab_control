@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tclab_control"
+version = "0.1.0"
+description = "Closed-loop control experiments on the TCLab thermal plant (system ID, PID, tuning)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "Stephen B. Johnson", email = "stevebj.ee@gmail.com" }]
+keywords = ["tclab", "control-systems", "pid", "system-identification", "fopdt"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering",
+]
+
+dependencies = [
+    "numpy",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+hardware = ["tclab"]      # real board + built-in TCLabModel simulator
+dev = ["pytest", "pytest-cov"]
+
+[project.urls]
+Homepage = "https://github.com/sbj-ee/tclab_control"
+Repository = "https://github.com/sbj-ee/tclab_control"
+
+[project.scripts]
+tclab-step = "tclab_control.experiments.step_test:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tclab_control"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
