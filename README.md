@@ -57,6 +57,32 @@ uv run tclab-run --from-fit data/step_hw.csv \
 −0.03 °C steady-state error** — close to the 0.4 % prediction (real settling is longer than
 the model, the expected real-plant-lag lesson).
 
+### What the committed plots show
+
+The CSVs under `data/` are gitignored, so the two committed PNGs are the only surviving
+record of those runs and the exact commands are not recoverable. Read from the plots:
+
+- **`data/run_hw.png`** — single setpoint to 50 °C, closing the loop at ambient (≈ 24.7 °C)
+  with **no preheat**, 600 iterations over 873 s (mean 1.455 s per iteration).
+- **`data/schedule_hw.png`** — a multi-setpoint run with an 80 % preheat and segment
+  boundaries at roughly 500 s and 1440 s over a ≈ 2180 s run. The middle segment is about
+  940 s, i.e. **≈ 650 iterations**, so this is the *extended-cooling* variant — the 35 °C
+  segment was lengthened after 500 iterations proved too short for passive cooling to
+  reach the setpoint.
+
+That last point matters if you are comparing against the schedule table in Appendix G of
+[EE_Ref](https://github.com/sbj-ee/EE_Ref): that table reports a **different run**, the
+`"50:300" "35:500" "40:500"` schedule where the 35 °C segment does *not* settle
+(+1.18 °C steady-state error). This plot is not that run.
+
+A schedule entry is a count of PID iterations, not a number of seconds — `run.py` loops
+`for _ in range(seg_seconds)` — and each iteration takes ≈ 1.44 s on real hardware because
+USB serial adds ≈ 0.45 s to the nominal 1 s sleep. So `"35:500"` is 500 control updates
+occupying roughly 12 minutes of wall-clock time, not 500 s.
+
+**Keep the CSV** from any run you intend to cite. Reconstructing segment durations from a
+PNG afterwards is guesswork.
+
 ### Live plot
 
 `tclab-run --live` opens a real-time matplotlib window (T vs. setpoint + heater %). It needs
